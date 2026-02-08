@@ -474,7 +474,7 @@ class ElectronicTrainer:
                 cv2.putText(frame, f"{int(distance)} px", mid_point,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Функция изменяет 'frame' на месте, возвращать не нужно
+
 
 
 
