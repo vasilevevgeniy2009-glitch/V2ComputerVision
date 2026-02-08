@@ -177,16 +177,11 @@ class MultiTaskVisionSystem:
         return self.draw_segmentation_results(frame, results)
 
     def run_pose_estimation(self, frame):
-        """Run pose estimation"""
-        results = self.models['pose'](
-            frame,
-            conf=self.config['conf_threshold'],
-            verbose=False,
-            imgsz=320
-        )
-        # Сначала рисуем основные результаты (скелет)
+        results = self.models['pose'](frame, conf=0.3, verbose=False, imgsz=320)
         processed_frame = self.draw_pose_results(frame, results)
 
+        # Новый продвинутый анализ позы
+        self.trainer.check_posture_hip_only(processed_frame, results)
         self.trainer.get_leg_distance(processed_frame, results)
 
         return processed_frame
@@ -432,6 +427,55 @@ class ElectronicTrainer:
 
         except Exception as e:
             print(f"Error in get_leg_distance: {e}")
+
+    def calculate_angle(self, a, b, c):
+        """Вычисляет угол между тремя точками в градусах."""
+        a, b, c = np.array(a), np.array(b), np.array(c)
+        radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+        angle = np.abs(radians * 180.0 / np.pi)
+        if angle > 180.0: angle = 360 - angle
+        return angle
+
+    def check_posture_hip_only(self, frame, results):
+        if not results or results[0].keypoints is None:
+            return
+
+        for kpts in results[0].keypoints.xy:
+            kpts = kpts.cpu().numpy()
+            if len(kpts) < 15: continue
+
+            # Точки
+            l_shoulder, l_hip, l_knee = kpts[5], kpts[11], kpts[13]
+            r_shoulder, r_hip, r_knee = kpts[6], kpts[12], kpts[14]
+
+            # Считаем вертикальные расстояния (разница по Y)
+            # Торс: Плечо - Бедро
+            torso_h = abs(l_hip[1] - l_shoulder[1])
+            # Бедро: Бедро - Колено
+            thigh_h = abs(l_knee[1] - l_hip[1])
+
+            # Расчет угла (как и был)
+            angle = self.calculate_angle(l_shoulder, l_hip, l_knee)
+
+            # Если thigh_h становится очень маленьким относительно torso_h,
+            # значит ноги "ушли" вглубь кадра (человек сел).
+            # В норме у стоячего человека это отношение около 0.8 - 1.2.
+            # У сидячего фронтально - падает ниже 0.4.
+            ratio = thigh_h / torso_h if torso_h != 0 else 1
+
+            if angle < 135 or ratio < 0.45:
+                status = "SITTING"
+                color = (0, 0, 255)
+            else:
+                status = "STANDING"
+                color = (0, 255, 0)
+
+            # Вывод отладочной информации (поможет настроить порог)
+            hip_p = l_hip.astype(int)
+            cv2.putText(frame, f"Ang: {int(angle)} Rat: {ratio:.2f}", (hip_p[0]+10, hip_p[1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            cv2.putText(frame, status, (hip_p[0]+10, hip_p[1]-25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
     def get_people_distance(self, frame, results):
         """
