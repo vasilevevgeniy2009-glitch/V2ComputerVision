@@ -358,10 +358,7 @@ class ElectronicTrainer:
         return None
 
     def check_boundary_violation(self, frame, results):
-        """
-        1. Автоматически находит красную зону.
-        2. Проверяет выход за её пределы.
-        """
+
         # Сначала ищем зону на текущем кадре
         detected_zone = self.detect_red_zone_area(frame)
 
