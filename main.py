@@ -32,26 +32,20 @@ class MultiTaskVisionSystem:
         self.trainer = ElectronicTrainer()
 
     def setup_camera(self, camera_id=0):
-        """Setup camera"""
-        self.cap = cv2.VideoCapture(camera_id)
-        if not self.cap.isOpened():
-            # Try other camera indices
-            for i in range(1, 5):
-                self.cap = cv2.VideoCapture(i)
-                if self.cap.isOpened():
-                    print(f"Camera found at index {i}")
-                    break
+        # ... твой существующий код захвата ...
+        self.cap = cv2.VideoCapture('test1.mp4')
 
-            if not self.cap.isOpened():
-                print("Camera not found, using test video...")
-                self.cap = cv2.VideoCapture('test_video.mp4')
-                if not self.cap.isOpened():
-                    raise ValueError("Failed to open camera or video")
+        # Получаем параметры исходного видео/камеры
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if fps == 0: fps = 20  # На случай, если камера не отдает FPS
 
-        # Set parameters for better performance
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # Настраиваем "записывающее устройство"
+        # 'mp4v' — это кодек, 'output_video.mp4' — имя файла
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.video_writer = cv2.VideoWriter('result_training.mp4', fourcc, fps, (width, height))
+        print(f"Recording started: result_training.mp4 ({width}x{height} @ {fps}fps)")
 
     def calculate_fps(self):
         """Calculate FPS"""
@@ -177,14 +171,21 @@ class MultiTaskVisionSystem:
         return self.draw_segmentation_results(frame, results)
 
     def run_pose_estimation(self, frame):
-        results = self.models['pose'](frame, conf=0.3, verbose=False, imgsz=320)
-        processed_frame = self.draw_pose_results(frame, results)
+        """Режим 5: Дуэль (только 2 стоящих человека)"""
+        results = self.models['pose'](
+            frame,
+            conf=0.25,
+            verbose=False,
+            imgsz=320
+        )
 
-        # Новый продвинутый анализ позы
-        self.trainer.check_posture_hip_only(processed_frame, results)
-        self.trainer.get_leg_distance(processed_frame, results)
+        # Мы НЕ используем draw_pose_results для всех,
+        # чтобы не рисовать скелеты на тех, кто сидит.
 
-        return processed_frame
+        # Запускаем режим дуэли
+        active_players = self.trainer.process_duel_mode(frame, results)
+
+        return frame
 
     def run_tracking(self, frame):
         """Run object tracking"""
@@ -260,6 +261,8 @@ class MultiTaskVisionSystem:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
                 cv2.imshow('Multi-Task Vision System (SMALL)', processed_frame)
+                self.video_writer.write(processed_frame)  # Записываем кадр в файл
+                cv2.imshow('Multi-Task Vision System (SMALL)', processed_frame)
 
             except Exception as e:
                 print(f"Processing error: {e}")
@@ -286,10 +289,10 @@ class MultiTaskVisionSystem:
         self.cleanup()
 
     def cleanup(self):
-        """Cleanup resources"""
         self.cap.release()
+        self.video_writer.release() # ОЧЕНЬ ВАЖНО: сохраняем файл на диск
         cv2.destroyAllWindows()
-        print("System stopped")
+        print("Video saved as result_training.mp4")
 
 
 def main():
@@ -357,6 +360,81 @@ class ElectronicTrainer:
 
         return None
 
+    def is_standing(self, kpts):
+        """Проверяет, стоит ли человек (без отрисовки)"""
+        if len(kpts) < 15: return False
+
+        l_shoulder, l_hip, l_knee = kpts[5], kpts[11], kpts[13]
+        if np.all(l_hip == 0) or np.all(l_shoulder == 0) or np.all(l_knee == 0):
+            return False
+
+        # Используем те же пороги, что и раньше
+        angle = self.calculate_angle(l_shoulder, l_hip, l_knee)
+        torso_v = abs(l_hip[1] - l_shoulder[1])
+        thigh_v = abs(l_knee[1] - l_hip[1])
+        ratio = thigh_v / torso_v if torso_v != 0 else 1
+
+        # Возвращаем True, если человек стоит
+        return not (angle < 130 or ratio < 0.45)
+
+    def process_duel_mode(self, frame, results):
+        """Выбирает двух стоящих людей и анализирует только их"""
+        if not results or results[0].keypoints is None:
+            return []
+
+        active_players = []
+
+        # 1. Собираем всех, кто стоит
+        for i, kpts_obj in enumerate(results[0].keypoints):
+            kpts = kpts_obj.xy[0].cpu().numpy()
+            conf = kpts_obj.conf[0].cpu().numpy()
+
+            if self.is_standing(kpts):
+                # Считаем площадь бокса (чтобы найти тех, кто ближе)
+                box = results[0].boxes[i].xyxy[0].cpu().numpy()
+                area = (box[2] - box[0]) * (box[3] - box[1])
+                active_players.append({
+                    'kpts': kpts,
+                    'area': area,
+                    'box': box,
+                    'conf': conf
+                })
+
+        # 2. Сортируем по площади (самые крупные/близкие — первые) и берем только двоих
+        active_players = sorted(active_players, key=lambda x: x['area'], reverse=True)[:2]
+
+        # 3. Отрисовываем аналитику только для этих двоих
+        centers = []
+        for player in active_players:
+            kpts = player['kpts']
+            box = player['box']
+
+            # Отрисовка статуса Standing
+            cv2.putText(frame, "ACTIVE", (int(box[0]), int(box[1] - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Точка центра для дистанции
+            centers.append(((int(box[0] + box[2]) // 2), (int(box[1] + box[3]) // 2)))
+
+            # Отрисовка шага (между лодыжками)
+            l_ankle, r_ankle = kpts[15], kpts[16]
+            if not (np.all(l_ankle == 0) or np.all(r_ankle == 0)):
+                dist = np.linalg.norm(l_ankle - r_ankle)
+                cv2.line(frame, tuple(l_ankle.astype(int)), tuple(r_ankle.astype(int)), (255, 255, 0), 2)
+                cv2.putText(frame, f"Step: {int(dist)}", (int(l_ankle[0]), int(l_ankle[1] + 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        # 4. Дистанция между двумя активными игроками
+        if len(centers) == 2:
+            p1, p2 = centers
+            dist_px = np.linalg.norm(np.array(p1) - np.array(p2))
+            color = (0, 0, 255) if dist_px < self.min_dist_people else (0, 255, 0)
+            cv2.line(frame, p1, p2, color, 2)
+            cv2.putText(frame, f"Dist: {int(dist_px)}px", ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+        return active_players
+
     def check_boundary_violation(self, frame, results):
 
         # Сначала ищем зону на текущем кадре
@@ -371,7 +449,7 @@ class ElectronicTrainer:
 
         # Рисуем найденную зону (зеленая рамка поверх красной разметки для подтверждения)
         cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
-        cv2.putText(frame, "DETECTED ZONE", (fx1, fy1 - 10),
+        cv2.putText(frame, "ZONE", (fx1, fy1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         if not results:
@@ -394,46 +472,70 @@ class ElectronicTrainer:
                             # ЧЕЛОВЕК ВЫШЕЛ ЗА ПРЕДЕЛЫ
                             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
                             cv2.circle(frame, (foot_x, foot_y), 8, (0, 0, 255), -1)
-                            cv2.putText(frame, "OUT OF ZONE!", (x1, y1 - 25),
+                            cv2.putText(frame, "Out of Zone!", (x1, y1 - 25),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+
     def get_leg_distance(self, frame, results):
         """
-        Рассчитывает и отображает расстояние между лодыжками (из режима Pose).
+        Улучшенный расчет расстояния между стопами для каждого человека.
         """
-        try:
-            if not results or results[0].keypoints is None or results[0].keypoints.xy.shape[0] == 0:
-                return
+        if not results or results[0].keypoints is None:
+            return
 
-            keypoints = results[0].keypoints.xy[0].cpu().numpy()
-            if len(keypoints) < 17:
-                return
+        # Перебираем всех людей, которых нашла нейросеть
+        for kpts in results[0].keypoints.xy:
+            kpts = kpts.cpu().numpy()
 
-            left_ankle = keypoints[15]
-            right_ankle = keypoints[16]
+            # Если точек меньше 17, значит скелет неполный — пропускаем
+            if len(kpts) < 17:
+                continue
 
-            if np.all(left_ankle == 0) or np.all(right_ankle == 0):
-                return
+            # Точки 15 (левая лодыжка) и 16 (правая лодыжка)
+            l_ankle = kpts[15]
+            r_ankle = kpts[16]
 
-            distance = np.linalg.norm(left_ankle - right_ankle)
-            x1, y1 = map(int, left_ankle)
-            x2, y2 = map(int, right_ankle)
+            # Проверка: если координаты (0,0), значит точка не видна
+            if np.all(l_ankle == 0) or np.all(r_ankle == 0):
+                continue
 
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"Distance: {int(distance)} px", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            # 1. Расчет расстояния (Евклидова метрика)
+            distance = np.linalg.norm(l_ankle - r_ankle)
 
-        except Exception as e:
-            print(f"Error in get_leg_distance: {e}")
+            # 2. Визуализация
+            x1, y1 = map(int, l_ankle)
+            x2, y2 = map(int, r_ankle)
+
+            # Рисуем кружки на лодыжках
+            cv2.circle(frame, (x1, y1), 5, (255, 255, 0), -1)
+            cv2.circle(frame, (x2, y2), 5, (255, 255, 0), -1)
+
+            # Рисуем линию между ними
+            color = (255, 255, 0)  # Голубой
+            cv2.line(frame, (x1, y1), (x2, y2), color, 2)
+
+            # Вычисляем центр линии для текста
+            mid_x = (x1 + x2) // 2
+            mid_y = (y1 + y2) // 2
+
+            # Добавляем подложку под текст, чтобы его было видно на любом фоне
+            label = f"Step: {int(distance)} px"
+            cv2.putText(frame, label, (mid_x - 40, mid_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)  # Тень
+            cv2.putText(frame, label, (mid_x - 40, mid_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
     def calculate_angle(self, a, b, c):
         """Вычисляет угол между тремя точками в градусах."""
         a, b, c = np.array(a), np.array(b), np.array(c)
-        radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+        radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
         angle = np.abs(radians * 180.0 / np.pi)
         if angle > 180.0: angle = 360 - angle
         return angle
 
-    def check_posture_hip_only(self, frame, results):
+    def check_posture_smart(self, frame, results):
+        """
+        Универсальная проверка: Угол (бок) + Коэффициент сокращения (перед).
+        """
         if not results or results[0].keypoints is None:
             return
 
@@ -441,79 +543,83 @@ class ElectronicTrainer:
             kpts = kpts.cpu().numpy()
             if len(kpts) < 15: continue
 
-            # Точки
+            # Точки для анализа (берем левую сторону как эталон, либо обе)
             l_shoulder, l_hip, l_knee = kpts[5], kpts[11], kpts[13]
             r_shoulder, r_hip, r_knee = kpts[6], kpts[12], kpts[14]
 
-            # Считаем вертикальные расстояния (разница по Y)
-            # Торс: Плечо - Бедро
-            torso_h = abs(l_hip[1] - l_shoulder[1])
-            # Бедро: Бедро - Колено
-            thigh_h = abs(l_knee[1] - l_hip[1])
+            # Проверка видимости
+            if np.all(l_hip == 0) or np.all(l_shoulder == 0) or np.all(l_knee == 0):
+                continue
 
-            # Расчет угла (как и был)
+            # 1. РАСЧЕТ УГЛА (для бокового вида)
             angle = self.calculate_angle(l_shoulder, l_hip, l_knee)
 
-            # Если thigh_h становится очень маленьким относительно torso_h,
-            # значит ноги "ушли" вглубь кадра (человек сел).
-            # В норме у стоячего человека это отношение около 0.8 - 1.2.
-            # У сидячего фронтально - падает ниже 0.4.
-            ratio = thigh_h / torso_h if torso_h != 0 else 1
+            # 2. РАСЧЕТ КОЭФФИЦИЕНТА (для фронтального вида)
+            # Измеряем вертикальную проекцию торса и бедра
+            torso_v = abs(l_hip[1] - l_shoulder[1])
+            thigh_v = abs(l_knee[1] - l_hip[1])
 
-            if angle < 135 or ratio < 0.45:
-                status = "SITTING"
-                color = (0, 0, 255)
+            # Отношение высоты бедра к высоте торса
+            ratio = thigh_v / torso_v if torso_v != 0 else 1
+
+            # --- ГИБРИДНАЯ ЛОГИКА ---
+            # Если угол маленький (бок) ИЛИ если нога сильно укоротилась в 2D (перед)
+            if angle < 130 or ratio < 0.45:
+                status = "Sitting"
+                color = (0, 0, 255)  # Красный
             else:
-                status = "STANDING"
-                color = (0, 255, 0)
+                status = "Standing"
+                color = (0, 255, 0)  # Зеленый
 
-            # Вывод отладочной информации (поможет настроить порог)
-            hip_p = l_hip.astype(int)
-            cv2.putText(frame, f"Ang: {int(angle)} Rat: {ratio:.2f}", (hip_p[0]+10, hip_p[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-            cv2.putText(frame, status, (hip_p[0]+10, hip_p[1]-25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            # Отрисовка данных для тестов
+            pos_x, pos_y = int(l_hip[0]), int(l_hip[1])
+            cv2.putText(frame, f"Ang: {int(angle)} Rat: {ratio:.2f}", (pos_x + 15, pos_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, status, (pos_x + 15, pos_y - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # Рисуем "костную" структуру для визуализации
+            cv2.line(frame, tuple(l_shoulder.astype(int)), tuple(l_hip.astype(int)), color, 2)
+            cv2.line(frame, tuple(l_hip.astype(int)), tuple(l_knee.astype(int)), color, 2)
 
     def get_people_distance(self, frame, results):
         """
-        Рассчитывает и отображает расстояние между людьми
+        Универсальный расчет расстояния между людьми для Detection и Pose режимов.
         """
         people_centers = []
-        person_class_id = 0
 
-        # Находим всех людей и их центральные точки
+        if not results:
+            return
+
         for result in results:
+            # Проверяем наличие боксов (они есть и в Detection, и в Pose)
             if result.boxes is not None:
                 for box in result.boxes:
-                    if int(box.cls[0]) == person_class_id:
+                    # Убеждаемся, что это человек (class 0)
+                    cls = int(box.cls[0])
+                    if cls == 0:
+                        # Берем координаты бокса
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        # Точный центр человека
                         center_x = (x1 + x2) // 2
                         center_y = (y1 + y2) // 2
-                        full_center = (center_x, center_y)
+                        people_centers.append((center_x, center_y))
 
-                        people_centers.append(full_center)
-
-        # Если есть 2 или более человека, рассчитываем расстояния
+        # Если нашли 2+ человека, рисуем линии
         if len(people_centers) >= 2:
+            import itertools
+            for p1, p2 in itertools.combinations(people_centers, 2):
+                dist = np.linalg.norm(np.array(p1) - np.array(p2))
 
-            for p1_center, p2_center in itertools.combinations(people_centers, 2):
+                # Цвет линии: красный если слишком близко, иначе зеленый
+                color = (0, 0, 255) if dist < self.min_dist_people else (0, 255, 0)
 
-                # Расчет Евклидова расстояния
-                distance = np.linalg.norm(np.array(p1_center) - np.array(p2_center))
+                cv2.line(frame, p1, p2, color, 2)
+                mid_point = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
 
-                # Визуализация
-                color = (0, 255, 0)
-                if distance < self.min_dist_people:
-                    color = (0, 0, 255)
-
-                cv2.line(frame, p1_center, p2_center, color, 2)
-
-                # Надпись с расстоянием
-                mid_point = ((p1_center[0] + p2_center[0]) // 2,
-                             (p1_center[1] + p2_center[1]) // 2)
-
-                cv2.putText(frame, f"{int(distance)} px", mid_point,
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # Текст с расстоянием
+                cv2.putText(frame, f"{int(dist)} px", mid_point,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
 
