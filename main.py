@@ -171,7 +171,7 @@ class MultiTaskVisionSystem:
         return self.draw_segmentation_results(frame, results)
 
     def run_pose_estimation(self, frame):
-        """Режим 5: Дуэль (только 2 стоящих человека)"""
+        """Режим 5: Только два стоящих бойца + Стойка + Средняя дистанция"""
         results = self.models['pose'](
             frame,
             conf=0.25,
@@ -179,11 +179,8 @@ class MultiTaskVisionSystem:
             imgsz=320
         )
 
-        # Мы НЕ используем draw_pose_results для всех,
-        # чтобы не рисовать скелеты на тех, кто сидит.
-
-        # Запускаем режим дуэли
-        active_players = self.trainer.process_duel_mode(frame, results)
+        # Вызываем обновленный процесс дуэли
+        self.trainer.process_duel_v3(frame, results)
 
         return frame
 
@@ -361,79 +358,97 @@ class ElectronicTrainer:
         return None
 
     def is_standing(self, kpts):
-        """Проверяет, стоит ли человек (без отрисовки)"""
+        """Проверка: стоит ли человек (для фильтрации тех, кто сидит)"""
         if len(kpts) < 15: return False
-
         l_shoulder, l_hip, l_knee = kpts[5], kpts[11], kpts[13]
         if np.all(l_hip == 0) or np.all(l_shoulder == 0) or np.all(l_knee == 0):
             return False
 
-        # Используем те же пороги, что и раньше
         angle = self.calculate_angle(l_shoulder, l_hip, l_knee)
         torso_v = abs(l_hip[1] - l_shoulder[1])
         thigh_v = abs(l_knee[1] - l_hip[1])
         ratio = thigh_v / torso_v if torso_v != 0 else 1
-
-        # Возвращаем True, если человек стоит
         return not (angle < 130 or ratio < 0.45)
 
-    def process_duel_mode(self, frame, results):
-        """Выбирает двух стоящих людей и анализирует только их"""
+    def get_stance_evaluation(self, kpts):
+        """Оценивает стойку: отношение ширины шага к высоте торса человека"""
+        l_ankle, r_ankle, l_hip, l_shoulder = kpts[15], kpts[16], kpts[11], kpts[5]
+
+        if any(np.all(pt == 0) for pt in [l_ankle, r_ankle, l_hip, l_shoulder]):
+            return None, (255, 255, 255)
+
+        step_dist = np.linalg.norm(l_ankle - r_ankle)
+        torso_h = np.linalg.norm(l_hip - l_shoulder)
+        if torso_h == 0: return None, (255, 255, 255)
+
+        ratio = step_dist / torso_h
+
+        # Пороги оценки (на основе биомеханики)
+        if ratio < 0.5:
+            return "PLOHO: SLISHKOM UZKO", (0, 0, 255)  # Красный
+        elif 0.5 <= ratio < 0.8:
+            return "UZKAYA STOYKA", (0, 255, 255)  # Желтый
+        elif 0.8 <= ratio < 1.4:
+            return "HOROSHAYA STOYKA", (0, 255, 0)  # Зеленый
+        elif 1.4 <= ratio < 1.8:
+            return "SHIROKAYA STOYKA", (0, 255, 255)  # Желтый
+        else:
+            return "PLOHO: SLISHKOM SHIROKO", (0, 0, 255)  # Красный
+
+    def calculate_avg_dist_between_people(self, kpts1, kpts2):
+        """Считает среднюю дистанцию между людьми по парам точек (путь)"""
+        # Пары индексов: Плечи(5,6), Бедра(11,12), Колени(13,14)
+        points_to_check = [5, 6, 11, 12, 13, 14]
+        distances = []
+
+        for idx in points_to_check:
+            p1, p2 = kpts1[idx], kpts2[idx]
+            if not (np.all(p1 == 0) or np.all(p2 == 0)):
+                distances.append(np.linalg.norm(p1 - p2))
+
+        return sum(distances) / len(distances) if distances else None
+
+    def process_duel_v3(self, frame, results):
+        """Основной процесс Режима 5: Дуэль двух бойцов"""
         if not results or results[0].keypoints is None:
-            return []
+            return
 
         active_players = []
-
-        # 1. Собираем всех, кто стоит
+        # Фильтруем: только стоящие люди
         for i, kpts_obj in enumerate(results[0].keypoints):
             kpts = kpts_obj.xy[0].cpu().numpy()
-            conf = kpts_obj.conf[0].cpu().numpy()
-
             if self.is_standing(kpts):
-                # Считаем площадь бокса (чтобы найти тех, кто ближе)
                 box = results[0].boxes[i].xyxy[0].cpu().numpy()
                 area = (box[2] - box[0]) * (box[3] - box[1])
-                active_players.append({
-                    'kpts': kpts,
-                    'area': area,
-                    'box': box,
-                    'conf': conf
-                })
+                active_players.append({'kpts': kpts, 'box': box, 'area': area})
 
-        # 2. Сортируем по площади (самые крупные/близкие — первые) и берем только двоих
+        # Оставляем только двоих самых крупных (ближних)
         active_players = sorted(active_players, key=lambda x: x['area'], reverse=True)[:2]
 
-        # 3. Отрисовываем аналитику только для этих двоих
         centers = []
         for player in active_players:
             kpts = player['kpts']
             box = player['box']
 
-            # Отрисовка статуса Standing
-            cv2.putText(frame, "ACTIVE", (int(box[0]), int(box[1] - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Оценка стойки
+            stance_text, stance_color = self.get_stance_evaluation(kpts)
+            if stance_text:
+                cv2.putText(frame, stance_text, (int(box[0]), int(box[3] + 25)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, stance_color, 2)
 
-            # Точка центра для дистанции
             centers.append(((int(box[0] + box[2]) // 2), (int(box[1] + box[3]) // 2)))
 
-            # Отрисовка шага (между лодыжками)
-            l_ankle, r_ankle = kpts[15], kpts[16]
-            if not (np.all(l_ankle == 0) or np.all(r_ankle == 0)):
-                dist = np.linalg.norm(l_ankle - r_ankle)
-                cv2.line(frame, tuple(l_ankle.astype(int)), tuple(r_ankle.astype(int)), (255, 255, 0), 2)
-                cv2.putText(frame, f"Step: {int(dist)}", (int(l_ankle[0]), int(l_ankle[1] + 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        # Расчет средней дистанции
+        if len(active_players) == 2:
+            avg_dist = self.calculate_avg_dist_between_people(active_players[0]['kpts'], active_players[1]['kpts'])
+            if avg_dist:
+                p1_c, p2_c = centers[0], centers[1]
+                line_color = (0, 0, 255) if avg_dist < self.min_dist_people else (0, 255, 0)
 
-        # 4. Дистанция между двумя активными игроками
-        if len(centers) == 2:
-            p1, p2 = centers
-            dist_px = np.linalg.norm(np.array(p1) - np.array(p2))
-            color = (0, 0, 255) if dist_px < self.min_dist_people else (0, 255, 0)
-            cv2.line(frame, p1, p2, color, 2)
-            cv2.putText(frame, f"Dist: {int(dist_px)}px", ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-        return active_players
+                cv2.line(frame, p1_c, p2_c, line_color, 2)
+                cv2.putText(frame, f"AVG DIST: {int(avg_dist)} px",
+                            ((p1_c[0] + p2_c[0]) // 2, (p1_c[1] + p2_c[1]) // 2 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, line_color, 2)
 
     def check_boundary_violation(self, frame, results):
 
@@ -620,6 +635,7 @@ class ElectronicTrainer:
                 # Текст с расстоянием
                 cv2.putText(frame, f"{int(dist)} px", mid_point,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
 
 
 
