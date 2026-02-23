@@ -409,12 +409,10 @@ class ElectronicTrainer:
         return sum(distances) / len(distances) if distances else None
 
     def process_duel_v3(self, frame, results):
-        """Основной процесс Режима 5: Дуэль двух бойцов"""
         if not results or results[0].keypoints is None:
             return
 
         active_players = []
-        # Фильтруем: только стоящие люди
         for i, kpts_obj in enumerate(results[0].keypoints):
             kpts = kpts_obj.xy[0].cpu().numpy()
             if self.is_standing(kpts):
@@ -422,29 +420,35 @@ class ElectronicTrainer:
                 area = (box[2] - box[0]) * (box[3] - box[1])
                 active_players.append({'kpts': kpts, 'box': box, 'area': area})
 
-        # Оставляем только двоих самых крупных (ближних)
         active_players = sorted(active_players, key=lambda x: x['area'], reverse=True)[:2]
 
         centers = []
         for player in active_players:
             kpts = player['kpts']
             box = player['box']
+            x1, y1, x2, y2 = map(int, box)
 
-            # Оценка стойки
+            # 1. Оценка стойки
             stance_text, stance_color = self.get_stance_evaluation(kpts)
+
+            # 2. РИСУЕМ РАМКУ (цвет зависит от стойки)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), stance_color, 2)
+
+            # 3. ПРОВЕРЯЕМ БАЛАНС (завал корпуса)
+            self.check_balance(frame, kpts, box)
+
             if stance_text:
-                cv2.putText(frame, stance_text, (int(box[0]), int(box[3] + 25)),
+                cv2.putText(frame, stance_text, (x1, y2 + 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, stance_color, 2)
 
-            centers.append(((int(box[0] + box[2]) // 2), (int(box[1] + box[3]) // 2)))
+            centers.append(((x1 + x2) // 2, (y1 + y2) // 2))
 
-        # Расчет средней дистанции
+        # 4. Средняя дистанция между двумя игроками
         if len(active_players) == 2:
             avg_dist = self.calculate_avg_dist_between_people(active_players[0]['kpts'], active_players[1]['kpts'])
             if avg_dist:
                 p1_c, p2_c = centers[0], centers[1]
                 line_color = (0, 0, 255) if avg_dist < self.min_dist_people else (0, 255, 0)
-
                 cv2.line(frame, p1_c, p2_c, line_color, 2)
                 cv2.putText(frame, f"AVG DIST: {int(avg_dist)} px",
                             ((p1_c[0] + p2_c[0]) // 2, (p1_c[1] + p2_c[1]) // 2 - 10),
@@ -635,6 +639,58 @@ class ElectronicTrainer:
                 # Текст с расстоянием
                 cv2.putText(frame, f"{int(dist)} px", mid_point,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    def check_balance(self, frame, kpts, box):
+        """
+        Идея №3: Контроль равновесия.
+        Проверяет, находится ли центр масс (плечи+таз) над площадью опоры (стопами).
+        """
+        # 1. Получаем ключевые точки
+        l_sh, r_sh = kpts[5], kpts[6]  # Плечи
+        l_hip, r_hip = kpts[11], kpts[12]  # Бедра
+        l_ank, r_ank = kpts[15], kpts[16]  # Лодыжки
+
+        # Проверяем, что нижние точки (опора) видны
+        if np.all(l_ank == 0) or np.all(r_ank == 0):
+            return
+
+        # 2. Находим среднюю X-координату корпуса (центр тяжести по горизонтали)
+        # Берем среднее из всех видимых точек торса
+        torso_points = [p[0] for p in [l_sh, r_sh, l_hip, r_hip] if not np.all(p == 0)]
+        if not torso_points: return
+        center_x = int(sum(torso_points) / len(torso_points))
+
+        # 3. Определяем границы опоры (min и max по стопам)
+        base_left = int(min(l_ank[0], r_ank[0]))
+        base_right = int(max(l_ank[0], r_ank[0]))
+
+        # 4. Рисуем визуализацию баланса (линия отвеса)
+        y_top = int(min(l_sh[1], r_sh[1])) if not np.all(l_sh == 0) else int(box[1])
+        y_bottom = int(max(l_ank[1], r_ank[1]))
+
+        # Проверка выхода за границы
+        is_off_balance = False
+        if center_x < base_left:
+            is_off_balance = True
+            error_side = "LEANING LEFT"
+        elif center_x > base_right:
+            is_off_balance = True
+            error_side = "LEANING RIGHT"
+
+        # Цвет линии: бирюзовый если всё ок, ярко-красный если завал
+        color = (0, 0, 255) if is_off_balance else (255, 255, 0)
+
+        # Рисуем "отвес" (вертикальную линию центра)
+        cv2.line(frame, (center_x, y_top), (center_x, y_bottom), color, 2, cv2.LINE_AA)
+        # Рисуем "базу" (линию между стопами)
+        cv2.line(frame, (base_left, y_bottom), (base_right, y_bottom), (255, 255, 255), 3)
+
+        if is_off_balance:
+            # Подсвечиваем опасную зону
+            cv2.putText(frame, "OFF-BALANCE!", (int(box[0]), int(box[1] - 35)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+            cv2.putText(frame, error_side, (center_x - 50, y_top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
 
 
